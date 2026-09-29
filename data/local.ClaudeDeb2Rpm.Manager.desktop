@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Desktop Manager
+GenericName=Application Installer
+Comment=Install, update and remove Claude Desktop on Fedora (unofficial)
+Exec=claude-deb2rpm-manager
+Icon=local.ClaudeDeb2Rpm.Manager
+Terminal=false
+Categories=System;PackageManager;GTK;
+Keywords=claude;anthropic;installer;update;deb;rpm;
+StartupNotify=true

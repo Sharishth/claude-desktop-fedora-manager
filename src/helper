@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+#
+# Privileged entry point for claude-deb2rpm-manager, run through pkexec.
+# Accepts only a fixed set of actions and flags.
+
+set -euo pipefail
+
+LIBEXEC="/usr/libexec/claude-deb2rpm-manager"
+
+[ "$(id -u)" -eq 0 ] || { echo "[claude] ERROR: helper must run as root" >&2; exit 1; }
+
+action="${1:-}"
+[ $# -gt 0 ] && shift
+
+args=()
+case "$action" in
+  install)
+    for a in "$@"; do
+      case "$a" in
+        --skip-current|--no-deps|--force) args+=("$a") ;;
+        *) echo "[claude] ERROR: rejected argument: $a" >&2; exit 2 ;;
+      esac
+    done
+    exec "$LIBEXEC/install.sh" "${args[@]}"
+    ;;
+  uninstall)
+    for a in "$@"; do
+      case "$a" in
+        --force) args+=("$a") ;;
+        *) echo "[claude] ERROR: rejected argument: $a" >&2; exit 2 ;;
+      esac
+    done
+    # User data is removed by the GUI as the desktop user, never here.
+    exec "$LIBEXEC/uninstall.sh" -y "${args[@]}"
+    ;;
+  *)
+    echo "[claude] ERROR: usage: helper install|uninstall [flags]" >&2
+    exit 2
+    ;;
+esac

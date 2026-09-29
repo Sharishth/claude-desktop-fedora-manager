@@ -1,0 +1,520 @@
+#!/usr/bin/python3
+#
+# Claude Desktop Manager (unofficial)
+#
+# GTK front end that installs, updates and removes Claude Desktop on Fedora by
+# converting Anthropic's official Debian package with alien. Privileged work
+# runs through a pkexec helper; user data removal runs as the desktop user.
+
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "local.ClaudeDeb2Rpm.Manager"
+APP_NAME = "Claude Desktop Manager"
+APP_VERSION = "1.0.0"
+
+PKG = "claude-desktop"
+HELPER = "/usr/libexec/claude-deb2rpm-manager/helper"
+MARKER = "/var/lib/claude-deb2rpm/installed"
+REPO = "https://downloads.claude.ai/claude-desktop/apt/stable"
+ARCH_MAP = {"x86_64": "amd64", "aarch64": "arm64"}
+
+ALIEN_RE = re.compile(r"converted from a \.?deb package by alien", re.IGNORECASE)
+FILENAME_RE = re.compile(
+    r"^Filename: pool/main/c/claude-desktop/claude-desktop_(.+)_[^_]+\.deb$",
+    re.MULTILINE,
+)
+
+HOME = os.path.expanduser("~")
+USER_DATA = [
+    os.path.join(HOME, p)
+    for p in (
+        ".config/Claude",
+        ".config/claude-desktop",
+        ".local/share/Claude",
+        ".local/share/claude-desktop",
+        ".cache/Claude",
+        ".cache/claude-desktop",
+    )
+]
+
+# pkexec: 126 = dialog dismissed, 127 = not authorized
+PKEXEC_DENIED = (126, 127)
+
+SOURCE_TEXT = {
+    "none": "Not installed",
+    "managed": "Converted from the official Debian package by this tool",
+    "foreign": "Installed by another source",
+}
+
+
+# ---------------------------------------------------------------------------
+# Queries
+# ---------------------------------------------------------------------------
+
+def version_key(v):
+    return [
+        (0, int(t), "") if t.isdigit() else (1, 0, t)
+        for t in re.findall(r"\d+|[A-Za-z]+", v)
+    ]
+
+
+def is_newer(candidate, current):
+    return version_key(candidate) > version_key(current)
+
+
+def run_quiet(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return r.returncode, r.stdout
+
+
+def query_installed():
+    rc, out = run_quiet(["rpm", "-q", "--queryformat", "%{VERSION}", PKG])
+    if rc != 0:
+        return None, "none"
+    version = out.strip()
+    if os.path.exists(MARKER):
+        return version, "managed"
+    _, info = run_quiet(["rpm", "-qi", PKG])
+    return version, ("managed" if ALIEN_RE.search(info) else "foreign")
+
+
+def query_latest():
+    arch = ARCH_MAP.get(platform.machine())
+    if arch is None:
+        raise RuntimeError(f"unsupported architecture {platform.machine()}")
+    url = f"{REPO}/dists/stable/main/binary-{arch}/Packages"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"repository unreachable ({getattr(e, 'reason', e)})") from e
+    versions = FILENAME_RE.findall(text)
+    if not versions:
+        raise RuntimeError("no claude-desktop package in repository index")
+    # Drop the Debian revision, matching how alien sets the rpm VERSION.
+    return max(versions, key=version_key).rsplit("-", 1)[0]
+
+
+def make_spinner():
+    if hasattr(Adw, "Spinner"):
+        return Adw.Spinner()
+    sp = Gtk.Spinner()
+    sp.start()
+    return sp
+
+
+# ---------------------------------------------------------------------------
+# Window
+# ---------------------------------------------------------------------------
+
+class ManagerWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title=APP_NAME)
+        self.set_default_size(580, 760)
+
+        self.busy = False
+        self.installed = None
+        self.state = "none"
+        self.latest = None
+        self.latest_error = None
+        self.checking = False
+
+        self.toasts = Adw.ToastOverlay()
+        toolbar = Adw.ToolbarView()
+
+        header = Adw.HeaderBar()
+        self.refresh_btn = Gtk.Button(
+            icon_name="view-refresh-symbolic", tooltip_text="Check for updates"
+        )
+        self.refresh_btn.connect("clicked", lambda *_: self.refresh())
+        header.pack_start(self.refresh_btn)
+
+        self.spinner = make_spinner()
+        self.spinner.set_visible(False)
+        header.pack_start(self.spinner)
+
+        menu = Gio.Menu()
+        menu.append("About " + APP_NAME, "app.about")
+        header.pack_end(
+            Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                           tooltip_text="Main menu")
+        )
+        toolbar.add_top_bar(header)
+
+        self.banner = Adw.Banner()
+        self.banner.connect("button-clicked", lambda *_: self.on_primary())
+        toolbar.add_top_bar(self.banner)
+
+        page = Adw.PreferencesPage()
+
+        # Status
+        status = Adw.PreferencesGroup(title="Status")
+        self.row_installed = Adw.ActionRow(title="Installed version")
+        self.row_latest = Adw.ActionRow(title="Latest available")
+        self.row_source = Adw.ActionRow(title="Source")
+        for row in (self.row_installed, self.row_latest, self.row_source):
+            row.add_css_class("property")
+            status.add(row)
+        page.add(status)
+
+        # Actions
+        actions = Adw.PreferencesGroup(title="Actions")
+
+        self.row_primary = Adw.ActionRow(title="Install")
+        self.btn_primary = Gtk.Button(label="Install", valign=Gtk.Align.CENTER)
+        self.btn_primary.add_css_class("suggested-action")
+        self.btn_primary.connect("clicked", lambda *_: self.on_primary())
+        self.row_primary.add_suffix(self.btn_primary)
+        actions.add(self.row_primary)
+
+        self.row_launch = Adw.ActionRow(
+            title="Launch Claude Desktop", subtitle="Start the installed application"
+        )
+        self.btn_launch = Gtk.Button(label="Launch", valign=Gtk.Align.CENTER)
+        self.btn_launch.connect("clicked", lambda *_: self.on_launch())
+        self.row_launch.add_suffix(self.btn_launch)
+        actions.add(self.row_launch)
+
+        self.row_uninstall = Adw.ActionRow(
+            title="Uninstall", subtitle="Remove Claude Desktop from this system"
+        )
+        self.btn_uninstall = Gtk.Button(label="Uninstall", valign=Gtk.Align.CENTER)
+        self.btn_uninstall.add_css_class("destructive-action")
+        self.btn_uninstall.connect("clicked", lambda *_: self.on_uninstall())
+        self.row_uninstall.add_suffix(self.btn_uninstall)
+        actions.add(self.row_uninstall)
+        page.add(actions)
+
+        # Options
+        options = Adw.PreferencesGroup(title="Options")
+        self.sw_nodeps = Adw.SwitchRow(
+            title="Skip runtime library check",
+            subtitle="Do not verify the GTK, NSS and audio libraries Electron needs",
+        )
+        self.sw_force = Adw.SwitchRow(
+            title="Take over existing installation",
+            subtitle="Allow actions on a claude-desktop package this tool did not create",
+        )
+        self.sw_force.connect("notify::active", lambda *_: self.update_ui())
+        options.add(self.sw_nodeps)
+        options.add(self.sw_force)
+        page.add(options)
+
+        # Log
+        log_group = Adw.PreferencesGroup(title="Log")
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic", tooltip_text="Copy log",
+                              valign=Gtk.Align.CENTER)
+        copy_btn.add_css_class("flat")
+        copy_btn.connect("clicked", lambda *_: self.copy_log())
+        log_group.set_header_suffix(copy_btn)
+
+        self.textview = Gtk.TextView(
+            editable=False, cursor_visible=False, monospace=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            top_margin=8, bottom_margin=8, left_margin=10, right_margin=10,
+        )
+        self.buffer = self.textview.get_buffer()
+        self.end_mark = self.buffer.create_mark("end", self.buffer.get_end_iter(), False)
+        scroller = Gtk.ScrolledWindow(min_content_height=240, child=self.textview)
+        frame = Gtk.Frame(child=scroller)
+        log_group.add(frame)
+        page.add(log_group)
+
+        self.toasts.set_child(page)
+        toolbar.set_content(self.toasts)
+        self.set_content(toolbar)
+
+        self.connect("close-request", self.on_close_request)
+        self.update_ui()
+        self.refresh()
+
+    # -- helpers ------------------------------------------------------------
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
+
+    def log(self, text):
+        # Keep only the final segment of carriage-return progress updates.
+        clean = "\n".join(part.split("\r")[-1] for part in text.split("\n"))
+        self.buffer.insert(self.buffer.get_end_iter(), clean)
+        self.textview.scroll_mark_onscreen(self.end_mark)
+
+    def copy_log(self):
+        start, end = self.buffer.get_bounds()
+        text = self.buffer.get_text(start, end, False)
+        provider = Gdk.ContentProvider.new_for_bytes(
+            "text/plain;charset=utf-8", GLib.Bytes.new(text.encode("utf-8"))
+        )
+        self.get_clipboard().set_content(provider)
+        self.toast("Log copied")
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.update_ui()
+
+    # -- state --------------------------------------------------------------
+
+    def refresh(self):
+        if self.checking:
+            return
+        self.checking = True
+        self.latest = None
+        self.latest_error = None
+        self.update_ui()
+
+        def worker():
+            inst, state = query_installed()
+            try:
+                latest, err = query_latest(), None
+            except Exception as e:  # noqa: BLE001
+                latest, err = None, str(e)
+            GLib.idle_add(self.apply_refresh, inst, state, latest, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_refresh(self, inst, state, latest, err):
+        self.checking = False
+        self.installed, self.state = inst, state
+        self.latest, self.latest_error = latest, err
+        self.update_ui()
+        return False
+
+    def update_available(self):
+        return bool(self.installed and self.latest and is_newer(self.latest, self.installed))
+
+    def update_ui(self):
+        inst = self.installed
+        allowed = self.state != "foreign" or self.sw_force.get_active()
+        idle = not self.busy
+
+        self.row_installed.set_subtitle(inst or "Not installed")
+        self.row_source.set_subtitle(SOURCE_TEXT[self.state])
+        if self.latest:
+            self.row_latest.set_subtitle(self.latest)
+        elif self.latest_error:
+            self.row_latest.set_subtitle(f"Unavailable: {self.latest_error}")
+        else:
+            self.row_latest.set_subtitle("Checking...")
+
+        if inst is None:
+            label, sub = "Install", "Download the official package, verify it and install"
+        elif self.update_available():
+            label, sub = "Update", f"Upgrade from {inst} to {self.latest}"
+        else:
+            label, sub = "Reinstall", "Install the latest version again"
+        self.row_primary.set_title(label)
+        self.row_primary.set_subtitle(sub)
+        self.btn_primary.set_label(label)
+
+        if self.state == "foreign" and not self.sw_force.get_active():
+            self.banner.set_title(
+                "Claude Desktop was installed by another source, possibly an official "
+                "package. Actions are disabled."
+            )
+            self.banner.set_button_label(None)
+            self.banner.set_revealed(True)
+        elif self.update_available() and idle:
+            self.banner.set_title(f"Claude Desktop {self.latest} is available")
+            self.banner.set_button_label("Update")
+            self.banner.set_revealed(True)
+        else:
+            self.banner.set_revealed(False)
+
+        self.btn_primary.set_sensitive(idle and allowed)
+        self.btn_uninstall.set_sensitive(idle and inst is not None and allowed)
+        self.btn_launch.set_sensitive(
+            idle and inst is not None and shutil.which("claude-desktop") is not None
+        )
+        self.refresh_btn.set_sensitive(idle and not self.checking)
+        self.sw_nodeps.set_sensitive(idle)
+        self.sw_force.set_sensitive(idle)
+        self.spinner.set_visible(self.busy or self.checking)
+
+    # -- privileged runs ------------------------------------------------------
+
+    def run_helper(self, action, args, on_done):
+        cmd = ["pkexec", HELPER, action, *args]
+        self.log(f"\n$ {' '.join(cmd)}\n")
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
+            )
+        except OSError as e:
+            self.log(f"failed to start: {e}\n")
+            self.toast("Could not start the helper")
+            return
+        self.set_busy(True)
+
+        def reader():
+            for raw in iter(proc.stdout.readline, b""):
+                GLib.idle_add(self._append_line, raw.decode("utf-8", "replace"))
+            proc.stdout.close()
+            status = proc.wait()
+            GLib.idle_add(self._on_exit, status, on_done)
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def _append_line(self, text):
+        self.log(text)
+        return False
+
+    def _on_exit(self, status, on_done):
+        self.set_busy(False)
+        if status in PKEXEC_DENIED:
+            self.log("authentication cancelled or not authorized\n")
+            self.toast("Authentication cancelled")
+            ok = False
+        else:
+            ok = status == 0
+            self.log(f"exit status {status}\n")
+        on_done(ok, status)
+        self.refresh()
+        return False
+
+    # -- actions --------------------------------------------------------------
+
+    def on_primary(self):
+        if self.busy:
+            return
+        args = []
+        if self.sw_nodeps.get_active():
+            args.append("--no-deps")
+        if self.sw_force.get_active():
+            args.append("--force")
+        label = self.btn_primary.get_label()
+
+        def done(ok, status):
+            if ok:
+                self.toast(f"{label} finished")
+            elif status not in PKEXEC_DENIED:
+                self.toast(f"{label} failed, see log")
+
+        self.run_helper("install", args, done)
+
+    def on_uninstall(self):
+        if self.busy:
+            return
+        dlg = Adw.AlertDialog(
+            heading="Uninstall Claude Desktop?",
+            body="The package and its system files will be removed.",
+        )
+        check = Gtk.CheckButton(label="Also delete my Claude Desktop settings and data")
+        dlg.set_extra_child(check)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("uninstall", "Uninstall")
+        dlg.set_response_appearance("uninstall", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.choose(self, None, self._on_uninstall_response, check)
+
+    def _on_uninstall_response(self, dlg, result, check):
+        if dlg.choose_finish(result) != "uninstall":
+            return
+        purge = check.get_active()
+        args = ["--force"] if self.sw_force.get_active() else []
+
+        def done(ok, status):
+            if not ok:
+                if status not in PKEXEC_DENIED:
+                    self.toast("Uninstall failed, see log")
+                return
+            if purge:
+                self.purge_user_data()
+            self.toast("Claude Desktop removed")
+
+        self.run_helper("uninstall", args, done)
+
+    def purge_user_data(self):
+        found = [p for p in USER_DATA if os.path.lexists(p)]
+        if not found:
+            self.log("no user data found\n")
+            return
+        for p in found:
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+                self.log(f"removed {p}\n")
+            except OSError as e:
+                self.log(f"could not remove {p}: {e}\n")
+
+    def on_launch(self):
+        try:
+            app = Gio.AppInfo.create_from_commandline(
+                "claude-desktop", "Claude", Gio.AppInfoCreateFlags.NONE
+            )
+            app.launch([], None)
+        except GLib.Error as e:
+            self.toast(f"Could not launch: {e.message}")
+
+    def on_close_request(self, *_):
+        if not self.busy:
+            return False
+        dlg = Adw.AlertDialog(
+            heading="Operation in progress",
+            body="Wait for the current operation to finish before closing.",
+        )
+        dlg.add_response("ok", "OK")
+        dlg.present(self)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+class ManagerApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        about = Gio.SimpleAction.new("about", None)
+        about.connect("activate", self.on_about)
+        self.add_action(about)
+        self.set_accels_for_action("window.close", ["<Control>w", "<Control>q"])
+
+    def do_activate(self):
+        win = self.props.active_window or ManagerWindow(self)
+        win.present()
+
+    def on_about(self, *_):
+        dlg = Adw.AboutDialog(
+            application_name=APP_NAME,
+            application_icon=APP_ID,
+            version=APP_VERSION,
+            developer_name="Sharishth",
+            license_type=Gtk.License.MIT_X11,
+            comments=(
+                "Installs and updates Claude Desktop on Fedora by converting "
+                "Anthropic's official Debian package.\n\n"
+                "Unofficial. Not affiliated with or endorsed by Anthropic."
+            ),
+        )
+        dlg.present(self.props.active_window)
+
+
+def main():
+    return ManagerApp().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
