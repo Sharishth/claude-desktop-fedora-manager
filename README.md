@@ -1,4 +1,4 @@
-# Claude Desktop for Fedora: GUI Installer and Updater (Unofficial RPM)
+# Claude Desktop for Fedora: GUI Installer and Updater or Script Only (Unofficial RPM)
 
 Install, update and remove **Claude Desktop** on **Fedora Linux** with a native GTK app or two shell scripts.
 
