@@ -6,6 +6,7 @@ Anthropic currently publishes the Claude Desktop Linux beta only as a `.deb` pac
 
 > [!IMPORTANT]
 > This is an unofficial community project. It is not affiliated with, endorsed by, or supported by Anthropic. Claude Desktop is proprietary software; this repository does not contain or redistribute it. Every install downloads the package from `downloads.claude.ai`.
+> Made Completely using claude.ai
 
 ![Claude Desktop Manager on Fedora showing an available update, with install, launch and uninstall actions](docs/screenshots/update-available.png)
 
